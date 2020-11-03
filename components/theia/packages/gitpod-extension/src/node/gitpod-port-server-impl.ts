@@ -28,6 +28,7 @@ export class GitpodPortServerImpl implements GitpodPortServer {
     async start(): Promise<void> {
         const client = await this.supervisorClientProvider.getStatusClient();
         while (this.run) {
+            let initial = true;
             try {
                 const req = new PortsStatusRequest();
                 req.setObserve(true);
@@ -38,6 +39,10 @@ export class GitpodPortServerImpl implements GitpodPortServer {
                     evts.on('close', resolve);
                     evts.on('error', reject);
                     evts.on('data', (update: PortsStatusResponse) => {
+                        if (initial) {
+                            this.ports.clear();
+                            initial = false;
+                        }
                         let added: PortsStatus.AsObject[] | undefined
                         for (const port of update.getAddedList()) {
                             const object = port.toObject();
@@ -67,10 +72,6 @@ export class GitpodPortServerImpl implements GitpodPortServer {
         }
     }
 
-    async getPorts(): Promise<PortsStatus.AsObject[]> {
-        return [...this.ports.values()];
-    }
-
     async exposePort(params: ExposeGitpodPortParams): Promise<void> {
         const controlClient = await this.supervisorClientProvider.getControlClient();
         const request = new ExposePortRequest();
@@ -83,6 +84,10 @@ export class GitpodPortServerImpl implements GitpodPortServer {
 
     setClient(client: GitpodPortClient): void {
         this.clients.add(client);
+        client.onDidChange({
+            initial: true,
+            added: [...this.ports.values()]
+        });
     }
     disposeClient(client: GitpodPortClient): void {
         this.clients.delete(client);

@@ -4,14 +4,14 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-import { injectable, inject, postConstruct } from 'inversify';
 import { FrontendApplicationContribution } from '@theia/core/lib/browser';
-import { TerminalFrontendContribution } from '@theia/terminal/lib/browser/terminal-frontend-contribution';
+import { Deferred } from '@theia/core/lib/common/promise-util';
 import { TerminalWidget } from '@theia/terminal/lib/browser/base/terminal-widget';
-import { GitpodTerminalWidget } from './gitpod-terminal-widget';
-import { GitpodTaskState, GitpodTaskServer, GitpodTask } from '../common/gitpod-task-protocol';
+import { TerminalFrontendContribution } from '@theia/terminal/lib/browser/terminal-frontend-contribution';
 import { IBaseTerminalServer } from '@theia/terminal/lib/common/base-terminal-protocol';
-import { Emitter } from '@theia/core';
+import { inject, injectable, postConstruct } from 'inversify';
+import { GitpodTask, GitpodTaskServer, GitpodTaskState } from '../common/gitpod-task-protocol';
+import { GitpodTerminalWidget } from './gitpod-terminal-widget';
 
 interface GitpodTaskTerminalWidget extends GitpodTerminalWidget {
     readonly kind: 'gitpod-task'
@@ -40,16 +40,20 @@ export class GitpodTaskContribution implements FrontendApplicationContribution {
     @inject(GitpodTaskServer)
     private readonly server: GitpodTaskServer;
 
-    private readonly onDidChangeEmitter = new Emitter<GitpodTask[]>();
-    private readonly onDidChange = this.onDidChangeEmitter.event;
-
     private readonly taskTerminals = new Map<string, GitpodTaskTerminalWidget>();
+
+    private readonly pendingInitialTasks = new Deferred<GitpodTask[]>();
+    private readonly pendingInitializeLayout = new Deferred<void>();
+    private updateQueue = this.pendingInitializeLayout.promise;
 
     @postConstruct()
     protected init(): void {
         // register client before connection is opened
         this.server.setClient({
-            onDidChange: ({ updated }) => this.onDidChangeEmitter.fire(updated)
+            onDidChange: ({ updated }) => {
+                this.pendingInitialTasks.resolve(updated);
+                this.queue(() => this.updateTerminals(updated));
+            }
         });
         this.terminals.onDidCreateTerminal(terminal => {
             if (GitpodTaskTerminalWidget.is(terminal)) {
@@ -69,7 +73,7 @@ export class GitpodTaskContribution implements FrontendApplicationContribution {
     }
 
     async onDidInitializeLayout(): Promise<void> {
-        const tasks = await this.server.getTasks();
+        const tasks = await this.pendingInitialTasks.promise;
         let ref: TerminalWidget | undefined;
         for (const task of tasks) {
             if (task.state == GitpodTaskState.CLOSED) {
@@ -101,8 +105,7 @@ export class GitpodTaskContribution implements FrontendApplicationContribution {
                 console.error('Failed to start Gitpod task terminal:', e);
             }
         }
-        this.updateTerminals(tasks);
-        this.onDidChange(tasks => this.updateTerminals(tasks));
+        this.pendingInitializeLayout.resolve();
 
         // if there is no terminal at all, lets start one
         if (!this.terminals.all.length) {
@@ -112,7 +115,7 @@ export class GitpodTaskContribution implements FrontendApplicationContribution {
         }
     }
 
-    protected async updateTerminals(tasks: GitpodTask[]): Promise<void> {
+    private async updateTerminals(tasks: GitpodTask[]): Promise<void> {
         for (const task of tasks) {
             try {
                 const id = GitpodTaskTerminalWidget.toTerminalId(task.id);
@@ -140,4 +143,9 @@ export class GitpodTaskContribution implements FrontendApplicationContribution {
             }
         }
     }
+
+    private queue(update: () => Promise<void>): Promise<void> {
+        return this.updateQueue = this.updateQueue.then(update, update);
+    }
+
 }

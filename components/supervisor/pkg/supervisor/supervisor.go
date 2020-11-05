@@ -296,6 +296,7 @@ supervisorLoop:
 			err := cmd.Start()
 			if err != nil {
 				if s == statusNeverRan {
+					time.Sleep(10000 * time.Minute)
 					log.WithError(err).Fatal("IDE failed to start")
 				}
 

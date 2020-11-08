@@ -7,6 +7,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -89,10 +90,15 @@ func configWithBlobserve() *Config {
 	return &cfg
 }
 
+type Target struct {
+	Status  int
+	Handler func(w http.ResponseWriter, r *http.Request, requestCount uint8) bool
+}
 type testTarget struct {
-	Status   int
-	listener net.Listener
-	server   *http.Server
+	*Target
+	RequestCount uint8
+	listener     net.Listener
+	server       *http.Server
 }
 
 func (tt *testTarget) Close() {
@@ -109,10 +115,18 @@ func startTestTarget(t *testing.T, host, name string) *testTarget {
 	}
 
 	tt := &testTarget{
-		Status:   http.StatusOK,
+		Target:   &Target{Status: http.StatusOK},
 		listener: l,
 	}
 	srv := &http.Server{Addr: host, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			tt.RequestCount++
+		}()
+
+		if tt.Handler != nil && tt.Handler(w, r, tt.RequestCount) {
+			return
+		}
+
 		if tt.Status == http.StatusOK {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
@@ -120,7 +134,11 @@ func startTestTarget(t *testing.T, host, name string) *testTarget {
 			return
 		}
 
-		w.WriteHeader(tt.Status)
+		if tt.Status != 0 {
+			w.WriteHeader(tt.Status)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	})}
 	go srv.Serve(l)
 	tt.server = srv
@@ -161,11 +179,11 @@ func TestRoutes(t *testing.T) {
 		Body   string
 	}
 	type Targets struct {
-		IDE        int
-		Blobserve  int
-		Workspace  int
-		Supervisor int
-		Port       int
+		IDE        *Target
+		Blobserve  *Target
+		Workspace  *Target
+		Supervisor *Target
+		Port       *Target
 	}
 	tests := []struct {
 		Desc        string
@@ -255,7 +273,7 @@ func TestRoutes(t *testing.T) {
 				addHostHeader,
 				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
-			Targets: &Targets{Workspace: http.StatusOK},
+			Targets: &Targets{Workspace: &Target{Status: http.StatusOK}},
 			Expectation: Expectation{
 				Status: http.StatusOK,
 				Header: http.Header{
@@ -272,7 +290,7 @@ func TestRoutes(t *testing.T) {
 				addHostHeader,
 				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
-			Targets: &Targets{Workspace: http.StatusOK, Blobserve: http.StatusNotFound},
+			Targets: &Targets{Workspace: &Target{Status: http.StatusOK}, Blobserve: &Target{Status: http.StatusNotFound}},
 			Expectation: Expectation{
 				Status: http.StatusOK,
 				Header: http.Header{
@@ -280,6 +298,23 @@ func TestRoutes(t *testing.T) {
 					"Content-Type":   {"text/plain; charset=utf-8"},
 				},
 				Body: "workspace hit: /not-from-blobserve\n",
+			},
+		},
+		{
+			Desc:   "blobserve IDE authorized GET /not-from-failed-blobserve",
+			Config: configWithBlobserve(),
+			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].URL+"not-from-failed-blobserve", nil),
+				addHostHeader,
+				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+			),
+			Targets: &Targets{Workspace: &Target{Status: http.StatusOK}, Blobserve: &Target{Status: http.StatusInternalServerError}},
+			Expectation: Expectation{
+				Status: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": {"42"},
+					"Content-Type":   {"text/plain; charset=utf-8"},
+				},
+				Body: "workspace hit: /not-from-failed-blobserve\n",
 			},
 		},
 		{
@@ -429,12 +464,37 @@ func TestRoutes(t *testing.T) {
 			},
 		},
 		{
+			Desc:   "blobserve supervisor frontend /main.js retry on timeout",
+			Config: configWithBlobserve(),
+			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].URL+"_supervisor/frontend/main.js", nil),
+				addHostHeader,
+			),
+			Targets: &Targets{Blobserve: &Target{
+				Handler: func(w http.ResponseWriter, r *http.Request, requestCount uint8) bool {
+					if requestCount != 0 {
+						return false
+					}
+					w.WriteHeader(http.StatusServiceUnavailable)
+					io.WriteString(w, "timeout")
+					return true
+				},
+			}},
+			Expectation: Expectation{
+				Status: http.StatusSeeOther,
+				Header: http.Header{
+					"Content-Type": {"text/html; charset=utf-8"},
+					"Location":     {"https://gitpod.io/blobserve/gitpod-io/supervisor:latest/__files__/main.js"},
+				},
+				Body: "<a href=\"https://gitpod.io/blobserve/gitpod-io/supervisor:latest/__files__/main.js\">See Other</a>.\n\n",
+			},
+		},
+		{
 			Desc: "port GET 404",
 			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].Ports[0].Url+"this-does-not-exist", nil),
 				addHostHeader,
 				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
-			Targets: &Targets{Port: http.StatusNotFound},
+			Targets: &Targets{Port: &Target{Status: http.StatusNotFound}},
 			Expectation: Expectation{
 				Header: http.Header{"Content-Length": {"0"}},
 				Status: http.StatusNotFound,
@@ -446,28 +506,29 @@ func TestRoutes(t *testing.T) {
 	log.Log.Logger.SetLevel(logrus.ErrorLevel)
 
 	defaultTargets := &Targets{
-		IDE:        http.StatusOK,
-		Blobserve:  http.StatusOK,
-		Port:       http.StatusOK,
-		Supervisor: http.StatusOK,
-		Workspace:  http.StatusOK,
+		IDE:        &Target{Status: http.StatusOK},
+		Blobserve:  &Target{Status: http.StatusOK},
+		Port:       &Target{Status: http.StatusOK},
+		Supervisor: &Target{Status: http.StatusOK},
+		Workspace:  &Target{Status: http.StatusOK},
 	}
 	targets := make(map[string]*testTarget)
-	controlTarget := func(status int, name, host string) {
+	controlTarget := func(target *Target, name, host string) {
 		_, runs := targets[name]
-		if runs && status == 0 {
+		if runs && target == nil {
 			targets[name].Close()
 			delete(targets, name)
 			return
 		}
 
-		if !runs && status != 0 {
+		if !runs && target != nil {
 			targets[name] = startTestTarget(t, host, name)
 			runs = true
 		}
 
 		if runs {
-			targets[name].Status = status
+			targets[name].Target = target
+			targets[name].RequestCount = 0
 		}
 	}
 	defer func() {
